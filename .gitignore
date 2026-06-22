@@ -1,0 +1,14 @@
+data/raw/*
+!data/raw/.gitkeep
+models/*
+!models/.gitkeep
+mlruns/
+wandb/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.csv
+!submissions/*.csv
+.env
+# Project exclude paths
+/models/
