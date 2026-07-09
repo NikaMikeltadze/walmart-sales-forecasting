@@ -1,0 +1,23 @@
+# Core
+pandas
+numpy
+scikit-learn
+matplotlib
+
+# Experiment tracking
+mlflow
+
+# Tree-based models
+xgboost
+lightgbm
+
+# Classical statistical models
+statsmodels
+pmdarima
+prophet
+
+# Deep learning models (N-BEATS, TFT/PatchTST, DLinear)
+darts
+
+# Notebook execution
+jupyter
