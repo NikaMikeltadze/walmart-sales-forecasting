@@ -30,6 +30,7 @@ No em dashes anywhere (project code-style rule) - hyphens only.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -101,23 +102,88 @@ def _fit_one_store_prophet(
     return int(store), model_to_json(model)
 
 
-def compute_store_share_stats(train_df: pd.DataFrame) -> tuple[dict[int, float], float]:
-    """Mean per-date STORE TOTAL Weekly_Sales (summed across depts), per store,
-    plus the grand mean of those store totals across all stores/dates.
+# How many trailing weeks of (non-holiday) history feed the regular-week dept
+# shares - recent enough that a dept's current mix matters more than its
+# 2010 mix, but still wide enough (half a year) for stable per-(Store, Dept)
+# averages. Holiday shares deliberately do NOT use this window - see
+# DeptShareStats below.
+DEPT_SHARE_RECENCY_WEEKS = 26
 
-    This is the correct denominator for `ProphetForecastPipeline`'s dept-share
-    calculation, since the per-store Prophet model is fit on that same
-    per-date store total (see `fit_store_models` below).
-    `WalmartFeatureEngineer.store_mean_` is a *per-row* mean instead (averaged
-    over every (Store, Dept, Date) row), which is smaller than the store's
-    total by roughly a factor of the store's department count and cannot be
-    substituted here - doing so inflates every disaggregated (Store, Dept)
-    prediction by that same factor.
+
+@dataclass
+class DeptShareStats:
+    """Stats behind `ProphetForecastPipeline._dept_share`, split into a
+    regular-week and a holiday-week regime (see its docstring for why)."""
+
+    store_total_mean_regular: dict[int, float]
+    avg_store_total_regular: float
+    store_dept_mean_regular: dict[tuple[int, int], float]
+    dept_mean_regular: dict[int, float]
+    avg_store_total_holiday: float
+    dept_mean_holiday: dict[int, float]
+
+
+def compute_dept_share_stats(
+    train_df: pd.DataFrame, recency_weeks: int = DEPT_SHARE_RECENCY_WEEKS
+) -> DeptShareStats:
+    """Stats for `ProphetForecastPipeline`'s dept-share disaggregation, split
+    by whether the target week is a holiday week (`IsHoliday`).
+
+    WMAE weights holiday weeks 5x, and department mix shifts hard on them
+    (e.g. toy/electronics depts spike at Christmas while others barely
+    move) - a single flat historical share misallocates the store's
+    forecast on exactly the weeks that matter most. So:
+
+    - **Regular weeks**: per-(Store, Dept) share, from the last
+      `recency_weeks` of non-holiday history - recent enough to track
+      drift in a store's own department mix.
+    - **Holiday weeks**: pooled across *all* stores per department, from
+      the FULL history (not the recency window) - a single store only sees
+      ~5 holiday weeks in 2.5 years of training data, far too sparse to
+      estimate a per-store holiday share reliably. Pooling trades away
+      store-specific holiday behavior for a much more stable estimate of
+      "how does this department's mix shift on a holiday week."
+
+    Both regimes fall back to the (regular-week) company-wide
+    `dept_mean_regular` / `avg_store_total_regular` ratio for a department
+    never seen in the relevant regime.
+
+    The denominators are per-date STORE TOTALS (summed across depts), not
+    `WalmartFeatureEngineer.store_mean_`'s per-row mean - the per-store
+    Prophet model is fit on that same per-date total (see
+    `fit_store_models` below), and the per-row mean would be off by
+    roughly the store's department count.
     """
-    store_totals = train_df.groupby(["Store", "Date"])["Weekly_Sales"].sum()
-    store_total_mean = store_totals.groupby("Store").mean().to_dict()
-    avg_store_total = float(store_totals.mean())
-    return store_total_mean, avg_store_total
+    train_df = train_df.copy()
+    train_df["Date"] = pd.to_datetime(train_df["Date"])
+    train_df["IsHoliday"] = train_df["IsHoliday"].astype(bool)
+
+    cutoff = train_df["Date"].max() - pd.Timedelta(weeks=recency_weeks)
+    recent_regular = train_df[(train_df["Date"] > cutoff) & (~train_df["IsHoliday"])]
+    holiday = train_df[train_df["IsHoliday"]]
+
+    regular_totals = recent_regular.groupby(["Store", "Date"])["Weekly_Sales"].sum()
+    store_total_mean_regular = regular_totals.groupby("Store").mean().to_dict()
+    avg_store_total_regular = float(regular_totals.mean())
+    store_dept_mean_regular = (
+        recent_regular.groupby(["Store", "Dept"])["Weekly_Sales"].mean().to_dict()
+    )
+    dept_mean_regular = recent_regular.groupby("Dept")["Weekly_Sales"].mean().to_dict()
+
+    holiday_totals = holiday.groupby(["Store", "Date"])["Weekly_Sales"].sum()
+    avg_store_total_holiday = (
+        float(holiday_totals.mean()) if len(holiday_totals) else avg_store_total_regular
+    )
+    dept_mean_holiday = holiday.groupby("Dept")["Weekly_Sales"].mean().to_dict()
+
+    return DeptShareStats(
+        store_total_mean_regular=store_total_mean_regular,
+        avg_store_total_regular=avg_store_total_regular,
+        store_dept_mean_regular=store_dept_mean_regular,
+        dept_mean_regular=dept_mean_regular,
+        avg_store_total_holiday=avg_store_total_holiday,
+        dept_mean_holiday=dept_mean_holiday,
+    )
 
 
 def fit_store_models(
@@ -187,49 +253,54 @@ class ProphetForecastPipeline:
     def __init__(
         self,
         store_models_json: dict[int, str],
-        store_total_mean: dict[int, float],
-        store_dept_mean: dict[tuple[int, int], float],
-        dept_mean: dict[int, float],
-        avg_store_total: float,
+        share_stats: DeptShareStats,
         global_row_mean: float,
         regressor_cols: list[str] | None = None,
         external_features: pd.DataFrame | None = None,
     ):
         self.store_models_json = store_models_json
-        self.store_total_mean = store_total_mean
-        self.store_dept_mean = store_dept_mean
-        self.dept_mean = dept_mean
-        self.avg_store_total = avg_store_total
+        self.share_stats = share_stats
         self.global_row_mean = global_row_mean
         self.regressor_cols = regressor_cols or []
         self.external_features = external_features
 
-    def _dept_share(self, store: int, dept: int) -> float:
-        """(Store, Dept)'s historical share of that store's total sales.
+    def _dept_share(self, store: int, dept: int, is_holiday: bool) -> float:
+        """(Store, Dept)'s share of that store's total sales, for a holiday
+        or a regular week - see `DeptShareStats` for why these differ.
 
-        `store_dept_mean` (a per-dept row mean) divided by `store_total_mean`
-        (a per-store TOTAL, summed across depts) gives the actual fraction of
-        the store's forecast this dept should receive - see
-        `compute_store_share_stats`. Falls back to the department's average
-        share of an average store's total (dept_mean / avg_store_total) when
-        this exact (Store, Dept) combo was never seen at fit time (e.g. a
-        department appearing at a store for the first time in test)."""
-        store_total = self.store_total_mean.get(store, self.avg_store_total)
-        sd_mean = self.store_dept_mean.get((store, dept))
+        Holiday weeks use the department's pooled (all-stores) share of an
+        average store's holiday-week total - a single store's own holiday
+        history is too sparse to trust per-store. Regular weeks use the
+        store's own recent per-dept share, falling back to the pooled
+        regular-week share when this (Store, Dept) combo has no recent
+        history (e.g. a department appearing at a store for the first time).
+        """
+        s = self.share_stats
+        if is_holiday:
+            if s.avg_store_total_holiday > 0:
+                return s.dept_mean_holiday.get(dept, 0.0) / s.avg_store_total_holiday
+            return 0.0
+
+        store_total = s.store_total_mean_regular.get(store, s.avg_store_total_regular)
+        sd_mean = s.store_dept_mean_regular.get((store, dept))
         if sd_mean is not None and store_total > 0:
             return sd_mean / store_total
-        if self.avg_store_total > 0:
-            return self.dept_mean.get(dept, 0.0) / self.avg_store_total
+        if s.avg_store_total_regular > 0:
+            return s.dept_mean_regular.get(dept, 0.0) / s.avg_store_total_regular
         return 0.0
 
     def predict(self, raw_test_df: pd.DataFrame) -> np.ndarray:
-        """Forecast Weekly_Sales for every row of a raw test.csv-shaped frame."""
+        """Forecast Weekly_Sales for every row of a raw test.csv-shaped frame.
+
+        Requires an `IsHoliday` column (present on both train.csv and
+        test.csv) to pick the holiday- vs regular-week share per row."""
         from prophet.serialize import model_from_json
 
-        df = raw_test_df[["Store", "Dept", "Date"]].copy()
+        df = raw_test_df[["Store", "Dept", "Date", "IsHoliday"]].copy()
         df["Date"] = pd.to_datetime(df["Date"])
         df["Store"] = df["Store"].astype(int)
         df["Dept"] = df["Dept"].astype(int)
+        df["IsHoliday"] = df["IsHoliday"].astype(bool)
 
         feat = add_temporal_features(df[["Date"]].drop_duplicates()).set_index("Date")
 
@@ -260,9 +331,13 @@ class ProphetForecastPipeline:
             yhat_by_date = dict(zip(fcast["ds"], fcast["yhat"]))
 
             for dept in df.loc[store_mask, "Dept"].unique():
-                mask = store_mask & (df["Dept"] == dept)
-                share = self._dept_share(store, int(dept))
-                preds.loc[mask] = df.loc[mask, "Date"].map(yhat_by_date).to_numpy() * share
+                dept_mask = store_mask & (df["Dept"] == dept)
+                for is_holiday in (False, True):
+                    mask = dept_mask & (df["IsHoliday"] == is_holiday)
+                    if not mask.any():
+                        continue
+                    share = self._dept_share(store, int(dept), is_holiday)
+                    preds.loc[mask] = df.loc[mask, "Date"].map(yhat_by_date).to_numpy() * share
 
         preds = preds.fillna(self.global_row_mean).clip(lower=0.0)
         return preds.to_numpy()
