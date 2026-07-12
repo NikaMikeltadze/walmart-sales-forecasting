@@ -51,7 +51,7 @@ Kaggle-ის კონკურსის [Walmart Recruiting - Store Sales Fore
 - **Person A** (ხეები + კლასიკა): XGBoost, LightGBM, ARIMA/SARIMA, პლუს TimesFM ბონუსად.
 - **Person B** (DL + Prophet): Prophet, DLinear, N-BEATS, TFT.
 
-საერთო ინფრასტრუქტურა, რომელსაც ორივე ტრეკი უცვლელად იყენებს, `src/`-შია: `preprocessing.py`, `features.py`, `evaluation.py`, `validation.py`, `pipeline.py`. ექსპერიმენტების ტრეკინგი - საერთო MLflow სერვერზე (DagsHub: `https://dagshub.com/NikaMikeltadze/walmart-sales-forecasting.mlflow`), თითო არქიტექტურაზე თითო ექსპერიმენტი (`XGBoost_Training`, `Prophet_Training`, ...) და სტანდარტიზებული run-სახელები (`{Model}_{Stage}`), რომ WMAE-ები პირდაპირ შედარებადი იყოს.
+საერთო ინფრასტრუქტურა, რომელსაც ორივე ტრეკი უცვლელად იყენებს, `src/`-შია: `preprocessing.py`, `features.py`, `evaluation.py`, `validation.py`, `pipeline.py`. ექსპერიმენტების ტრეკინგი - საერთო MLflow სერვერზე (DagsHub: [DagsHub MLflow Server](https://dagshub.com/NikaMikeltadze/walmart-sales-forecasting.mlflow)), თითო არქიტექტურაზე თითო ექსპერიმენტი (`XGBoost_Training`, `Prophet_Training`, ...) და სტანდარტიზებული run-სახელები (`{Model}_{Stage}`), რომ WMAE-ები პირდაპირ შედარებადი იყოს.
 
 ყველა მოდელი შენახულია **Pipeline-ად**, რომელიც დაუმუშავებელ `test.csv`-ის ფორმის მონაცემს იღებს და მთელ პრეპროცესინგს შიგნით აკეთებს - ეს `model_inference.ipynb`-ის მოთხოვნაა.
 
