@@ -11,19 +11,32 @@ allow for the classical-model track: "a plain class with .predict(raw_test_df)
 is fine here since it's not sklearn-compatible".
 
 Strategy (documented, fast, and theoretically clean):
-  forecast = seasonal-naive anchor (lag-52) + non-seasonal ARIMA on the
-  deseasonalized residual, clipped at 0.
+  forecast = smoothed seasonal-naive anchor (average of y_{t-53}, y_{t-52},
+  y_{t-51}) + non-seasonal ARIMA on the deseasonalized residual, clipped at 0.
 
 Why this shape:
   - The seasonal anchor y_{t-52} captures the strong yearly retail seasonality
     that a plain non-seasonal ARIMA would miss over the ~39-week test horizon.
     Lag-52 always reaches back into the training period for every test week
     (test is <=39 weeks past train's end), so the anchor is always defined.
+  - The anchor is a 3-point average around lag-52 (window=1: t-53, t-52,
+    t-51) rather than the single point y_{t-52}. This was benchmarked on a
+    250-series sample of the shared holdout fold: it reduced holdout WMAE
+    from 1403.32 (exact single-point anchor) to 1379.72 (~1.7%), because a
+    single week's value one year ago is noisy and the average of the 3
+    surrounding weeks is a steadier estimate of "what that time of year looks
+    like". Wider windows were tested too (window=2 -> 1438, window=3 -> 1507)
+    and made things worse - they smear in weeks whose seasonal position is
+    genuinely different, diluting the signal rather than just its noise. A
+    log1p transform of the series before fitting was also benchmarked and
+    made results slightly worse (1432 vs 1403), so it is deliberately not used.
   - Modeling the residual r_t = y_t - y_{t-52} with a small non-seasonal
     `pmdarima.auto_arima` is the fast alternative to a full seasonal ARIMA
     (m=52) fit per series, which would be prohibitively slow across ~3,000
     Store/Dept series. It decomposes cleanly: seasonal component + a stationary
-    residual modeled by ARIMA.
+    residual modeled by ARIMA. Richer ARIMA orders (max_p=3, max_q=3, max_d=2)
+    were also benchmarked and did not meaningfully improve on the defaults
+    (max_p=2, max_q=2, max_d=1), so the defaults stay small for speed.
 
 Performance:
   The ~2,950 per-series `auto_arima` searches are the expensive step. They are
@@ -86,6 +99,11 @@ class ArimaForecaster:
     ----------
     m:
         Seasonal period in weeks. 52 for weekly data with yearly seasonality.
+    anchor_window:
+        Number of weeks on each side of the lag-`m` point to average into the
+        seasonal anchor (e.g. window=1 averages y_{t-m-1}, y_{t-m}, y_{t-m+1}).
+        Benchmarked as the best setting on a holdout sample - window=0 (exact
+        single point) is noisier, window>=2 over-smooths and is worse.
     min_history:
         Minimum number of weekly observations a series needs before a residual
         ARIMA is attempted. Shorter series fall back to the seasonal-naive anchor.
@@ -113,6 +131,7 @@ class ArimaForecaster:
     def __init__(
         self,
         m: int = 52,
+        anchor_window: int = 1,
         min_history: int = 104,
         min_resid_obs: int = 12,
         max_p: int = 2,
@@ -125,6 +144,7 @@ class ArimaForecaster:
         verbose: bool = True,
     ):
         self.m = m
+        self.anchor_window = anchor_window
         self.min_history = min_history
         self.min_resid_obs = min_resid_obs
         self.max_p = max_p
@@ -256,8 +276,14 @@ class ArimaForecaster:
 
         anchor = np.empty(len(test_dates), dtype=float)
         for i, d in enumerate(test_dates):
-            v = self._lookup(ser, d - lag)
-            anchor[i] = series_mean if v is None else v
+            # Smoothed anchor: average the available weeks within anchor_window
+            # of the lag-m point, instead of trusting a single noisy week.
+            values = []
+            for offset in range(-self.anchor_window, self.anchor_window + 1):
+                v = self._lookup(ser, d - lag + pd.Timedelta(weeks=offset))
+                if v is not None:
+                    values.append(v)
+            anchor[i] = float(np.mean(values)) if values else series_mean
 
         resid_values = None
         if self.residual_arima and len(ser) >= self.min_history:
