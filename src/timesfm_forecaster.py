@@ -62,6 +62,12 @@ import pandas as pd
 class TimesFMForecaster:
     """Per-series zero-shot TimesFM forecaster for raw test frames.
 
+    Targets the TimesFM 2.5 package API
+    (`timesfm.TimesFM_2p5_200M_torch.from_pretrained(...)` + `model.compile(
+    timesfm.ForecastConfig(...))` + `model.forecast(horizon=..., inputs=[...])`).
+    This is the version that installs on current Colab (Python 3.12); the older
+    1.x `TimesFm`/`TimesFmHparams` API is not used.
+
     Parameters
     ----------
     m:
@@ -69,31 +75,32 @@ class TimesFMForecaster:
         Used only to size the weekly reindex grid / sanity messaging; TimesFM
         infers seasonality from the context itself.
     context_len:
-        Number of most-recent weekly observations fed to TimesFM as context.
-        Should be >= the longest per-series history (~143 weeks) so the full
-        history is used; TimesFM 2.0 supports up to 2048. Must be a multiple of
-        the model's input patch length (32) - the default 512 satisfies this.
+        Number of most-recent weekly observations fed to TimesFM as context, and
+        the model's `max_context`. Should be >= the longest per-series history
+        (~143 weeks) so the full history is used. TimesFM 2.5 supports very long
+        contexts; 512 is ample here (more than one 52-week cycle) and fast.
     horizon_len:
         Number of steps TimesFM forecasts ahead. 39 for the full Kaggle test span
         (2012-11-02 -> 2013-07-26); pass 13 when validating on the shared 13-week
         holdout fold.
+    max_horizon:
+        `max_horizon` passed to `ForecastConfig` at compile time. The effective
+        value is `max(horizon_len, max_horizon)`, so the compiled model always
+        covers the requested horizon.
     checkpoint:
-        Hugging Face repo id of the TimesFM checkpoint to load.
-    backend:
-        TimesFM backend, "gpu" or "cpu". Use "gpu" on a Colab GPU runtime.
-    per_core_batch_size:
-        TimesFM per-core batch size for inference.
-    freq:
-        TimesFM frequency indicator per series. 0 = high frequency (sub-daily/
-        daily), 1 = medium (weekly/monthly), 2 = low (quarterly/yearly). Weekly
-        data uses 1.
+        Hugging Face repo id of the TimesFM 2.5 checkpoint to load.
     min_context:
         Minimum number of weekly observations a series needs before TimesFM is
         trusted. Shorter series fall back to their own mean (mirrors ARIMA's
         `min_history`).
-    num_layers, use_positional_embedding:
-        TimesFM architecture hparams that must match the chosen checkpoint. The
-        defaults match `google/timesfm-2.0-500m-pytorch`.
+    infer_batch_size:
+        Number of series per `model.forecast` call. Series are chunked at this
+        size and the results concatenated, to bound GPU memory across the ~3,000
+        series in the full panel.
+    normalize_inputs, infer_is_positive:
+        `ForecastConfig` flags. `normalize_inputs` per-series-normalizes the
+        context (helps across the wildly different sales scales); `infer_is_positive`
+        keeps forecasts non-negative, which suits sales (we still clip at 0 too).
     verbose:
         If True, print how many series went to TimesFM vs the fallback.
     """
@@ -103,25 +110,23 @@ class TimesFMForecaster:
         m: int = 52,
         context_len: int = 512,
         horizon_len: int = 39,
-        checkpoint: str = "google/timesfm-2.0-500m-pytorch",
-        backend: str = "gpu",
-        per_core_batch_size: int = 32,
-        freq: int = 1,
+        max_horizon: int = 64,
+        checkpoint: str = "google/timesfm-2.5-200m-pytorch",
         min_context: int = 52,
-        num_layers: int = 50,
-        use_positional_embedding: bool = False,
+        infer_batch_size: int = 512,
+        normalize_inputs: bool = True,
+        infer_is_positive: bool = True,
         verbose: bool = True,
     ):
         self.m = m
         self.context_len = context_len
         self.horizon_len = horizon_len
+        self.max_horizon = max_horizon
         self.checkpoint = checkpoint
-        self.backend = backend
-        self.per_core_batch_size = per_core_batch_size
-        self.freq = freq
         self.min_context = min_context
-        self.num_layers = num_layers
-        self.use_positional_embedding = use_positional_embedding
+        self.infer_batch_size = infer_batch_size
+        self.normalize_inputs = normalize_inputs
+        self.infer_is_positive = infer_is_positive
         self.verbose = verbose
         self._model = None  # loaded lazily, never pickled
 
@@ -264,37 +269,54 @@ class TimesFMForecaster:
         return context, level
 
     def _load_model(self):
-        """Lazily import and construct the TimesFM model. Isolated so the module
-        stays importable without timesfm installed, and so the model is built at
-        most once per process."""
+        """Lazily import, construct, and compile the TimesFM 2.5 model. Isolated
+        so the module stays importable without timesfm installed, and so the model
+        is built at most once per process."""
         if self._model is not None:
             return self._model
 
         import timesfm
 
-        self._model = timesfm.TimesFm(
-            hparams=timesfm.TimesFmHparams(
-                backend=self.backend,
-                per_core_batch_size=self.per_core_batch_size,
-                context_len=self.context_len,
-                horizon_len=self.horizon_len,
-                num_layers=self.num_layers,
-                use_positional_embedding=self.use_positional_embedding,
-            ),
-            checkpoint=timesfm.TimesFmCheckpoint(huggingface_repo_id=self.checkpoint),
+        # This wrapper targets the timesfm 2.5 API. Fail loudly and actionably if
+        # the installed package exposes a different interface, rather than with a
+        # deep AttributeError inside the constructor.
+        if not hasattr(timesfm, "TimesFM_2p5_200M_torch"):
+            raise ImportError(
+                "The installed `timesfm` does not expose the 2.5 API "
+                "(`timesfm.TimesFM_2p5_200M_torch`) this wrapper targets. Install "
+                "'timesfm[torch]' and, if timesfm was already imported this session, "
+                "restart the runtime and re-run from the top."
+            )
+
+        model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(self.checkpoint)
+        model.compile(
+            timesfm.ForecastConfig(
+                max_context=self.context_len,
+                max_horizon=max(self.horizon_len, self.max_horizon),
+                normalize_inputs=self.normalize_inputs,
+                use_continuous_quantile_head=True,
+                force_flip_invariance=True,
+                infer_is_positive=self.infer_is_positive,
+                fix_quantile_crossing=True,
+            )
         )
+        self._model = model
         return self._model
 
     def _forecast_batch(self, inputs: list) -> list:
-        """Run one batched TimesFM zero-shot forecast over `inputs` (a list of 1D
+        """Run the TimesFM 2.5 zero-shot forecast over `inputs` (a list of 1D
         context arrays) and return a list of `horizon_len`-step point forecasts.
+        Series are processed in chunks of `infer_batch_size` to bound GPU memory.
 
         This is the single place that touches the `timesfm` package's forecast
         API - adjust here if the installed version differs."""
         model = self._load_model()
-        freqs = [self.freq] * len(inputs)
-        point_forecast, _ = model.forecast(inputs, freq=freqs)
-        return [np.asarray(row, dtype=float) for row in point_forecast]
+        out = []
+        for start in range(0, len(inputs), self.infer_batch_size):
+            chunk = [np.asarray(x, dtype=float) for x in inputs[start:start + self.infer_batch_size]]
+            point_forecast, _ = model.forecast(horizon=self.horizon_len, inputs=chunk)
+            out.extend(np.asarray(row, dtype=float) for row in point_forecast)
+        return out
 
     # ------------------------------------------------------------ pickling
     def __getstate__(self):
