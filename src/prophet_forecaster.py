@@ -50,6 +50,7 @@ No em dashes anywhere (project code-style rule) - hyphens only.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -271,12 +272,17 @@ def fit_series_models(
         jobs.append((key, g["Date"].to_numpy(), g["Weekly_Sales"].to_numpy()))
 
     if verbose:
+        n_cores = os.cpu_count() or 1
         print(
-            f"Fitting {len(jobs)} per-(Store, Dept) Prophet models (n_jobs={n_jobs}); "
+            f"Fitting {len(jobs)} per-(Store, Dept) Prophet models "
+            f"(n_jobs={n_jobs}, {n_cores} cores visible); "
             f"{skipped} series under {MIN_OBS_FOR_PROPHET} obs go to the fallback."
         )
 
-    results = Parallel(n_jobs=n_jobs, batch_size=16)(
+    # verbose=10 makes joblib emit a running "N tasks done / elapsed / ETA" line
+    # to stderr. Without it a full-panel fit is 20+ silent minutes with no way to
+    # tell 10% from 90%, which is not a reasonable thing to ask of anyone.
+    results = Parallel(n_jobs=n_jobs, batch_size=16, verbose=10 if verbose else 0)(
         delayed(_fit_one_series)(key, dates, values, holidays_df, config, xmas_frame)
         for key, dates, values in jobs
     )
@@ -387,11 +393,15 @@ class ProphetPanelPipeline:
         fallback: FallbackStats,
         config: ProphetConfig,
         n_jobs: int = -1,
+        verbose: int = 0,
     ):
         self.series_models_json = series_models_json
         self.fallback = fallback
         self.config = config
         self.n_jobs = n_jobs
+        # joblib verbosity for predict(). Deserializing ~3,000 models from JSON
+        # and forecasting each is minutes of work, not seconds - worth a counter.
+        self.verbose = verbose
 
     def _fallback_predict(self, df: pd.DataFrame) -> np.ndarray:
         f = self.fallback
@@ -423,7 +433,7 @@ class ProphetPanelPipeline:
                 continue
             jobs.append((key, model_json, g["Date"].drop_duplicates().sort_values().to_numpy()))
 
-        results = Parallel(n_jobs=self.n_jobs, batch_size=16)(
+        results = Parallel(n_jobs=self.n_jobs, batch_size=16, verbose=self.verbose)(
             delayed(_predict_one_series)(key, model_json, dates, self.config, xmas_frame)
             for key, model_json, dates in jobs
         )

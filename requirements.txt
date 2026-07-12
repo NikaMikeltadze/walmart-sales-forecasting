@@ -3,9 +3,13 @@ pandas
 numpy
 scikit-learn
 matplotlib
+# Imported directly (parallel per-series Prophet fits, model persistence)
+# rather than relied on as a transitive scikit-learn dependency.
+joblib
 
 # Experiment tracking
 mlflow
+python-dotenv
 
 # Tree-based models
 xgboost
@@ -17,7 +21,7 @@ pmdarima
 prophet
 
 # Deep learning models (N-BEATS, TFT/PatchTST, DLinear)
-darts
+darts[torch]
 
 # Notebook execution
 jupyter
