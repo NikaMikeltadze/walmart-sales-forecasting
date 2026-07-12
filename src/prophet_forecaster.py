@@ -152,6 +152,9 @@ class ProphetConfig:
     seasonality_prior_scale: float = 10.0
     holidays_prior_scale: float = 10.0
     use_xmas_regressors: bool = True
+    # Per-series wall-clock cap. A healthy fit here takes ~10ms; anything past
+    # a few seconds is not converging and never will. See _FitTimeout.
+    fit_timeout_seconds: int = 30
 
     def as_mlflow_params(self) -> dict:
         return {f"prophet_{k}": v for k, v in self.__dict__.items()}
@@ -195,17 +198,94 @@ def build_walmart_holidays(include_christmas_dummies: bool = False) -> pd.DataFr
 # ---------------------------------------------------------------------------
 # Fit
 # ---------------------------------------------------------------------------
+# A series has to actually vary for a seasonal model to mean anything. Prophet
+# does not merely fit these badly - Stan's L-BFGS optimizer can fail to
+# converge on a constant or near-constant target and spin without a timeout,
+# wedging a joblib worker indefinitely. (Observed exactly that: 2,921 of 2,991
+# series fit in 28 seconds, then the run hung on the tail.) So screen them out
+# up front and let FallbackStats handle them, which is what we would want for a
+# flat series anyway.
+MIN_DISTINCT_VALUES = 5
+
+
+class _FitTimeout:
+    """Hard wall-clock cap on a single Prophet fit, as a context manager.
+
+    The degeneracy screen above catches the failure mode we actually saw, but
+    it is a heuristic and Stan's optimizer has no timeout of its own. This is
+    the backstop: whatever else goes wrong, one series cannot hang the panel
+    forever. A fit that trips this is treated as unfittable and its rows fall
+    through to FallbackStats.
+
+    SIGALRM is POSIX-only (Colab/Linux, macOS). On Windows this degrades to a
+    no-op, which is acceptable - the degeneracy screen still applies, and the
+    panel fit is not something anyone runs on Windows here.
+    """
+
+    def __init__(self, seconds: int):
+        self.seconds = seconds
+
+    def __enter__(self):
+        if self.seconds <= 0:
+            return self
+        try:
+            import signal
+
+            self._prev = signal.signal(signal.SIGALRM, self._raise)
+            signal.alarm(self.seconds)
+        except (ImportError, AttributeError, ValueError):
+            self.seconds = 0  # no SIGALRM here (Windows, or not the main thread)
+        return self
+
+    def __exit__(self, *exc):
+        if self.seconds <= 0:
+            return False
+        import signal
+
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self._prev)
+        return False
+
+    @staticmethod
+    def _raise(signum, frame):
+        raise TimeoutError("Prophet fit exceeded its per-series time budget")
+
+
+def _is_degenerate(values: np.ndarray) -> bool:
+    """True if this series has nothing for a seasonal model to fit."""
+    y = np.asarray(values, dtype=float)
+    y = y[np.isfinite(y)]
+    if len(y) < MIN_OBS_FOR_PROPHET:
+        return True
+    if len(np.unique(y)) < MIN_DISTINCT_VALUES:
+        return True
+    # Std is scale-dependent, so compare it against the series' own level.
+    scale = np.abs(y).mean()
+    if scale <= 0:
+        return True
+    return float(np.std(y)) / scale < 1e-6
+
+
 def _fit_one_series(key, dates, values, holidays_df, config, xmas_frame):
     """Fit one (Store, Dept) Prophet model in a joblib worker process.
 
-    Returns (key, model_json) - a JSON string rather than the live model,
-    since that is what survives the trip back to the parent process and a
-    later joblib.dump / MLflow artifact reliably.
+    Returns (key, model_json), or (key, None) when the series is degenerate or
+    the fit raises - callers drop the Nones and the row falls through to
+    FallbackStats. One unfittable series out of ~3,000 must not take the whole
+    panel down with it.
+
+    Returns a JSON string rather than the live model, since that is what
+    survives the trip back to the parent process and a later joblib.dump /
+    MLflow artifact reliably.
     """
     from prophet import Prophet
     from prophet.serialize import model_to_json
 
+    if _is_degenerate(values):
+        return key, None
+
     df = pd.DataFrame({"ds": pd.to_datetime(dates), "y": values})
+    _t = _FitTimeout(config.fit_timeout_seconds)
     if config.use_xmas_regressors:
         for col in XMAS_REGRESSOR_COLS:
             df[col] = df["ds"].map(xmas_frame[col])
@@ -230,7 +310,14 @@ def _fit_one_series(key, dates, values, holidays_df, config, xmas_frame):
     if config.use_xmas_regressors:
         for col in XMAS_REGRESSOR_COLS:
             model.add_regressor(col)
-    model.fit(df)
+
+    try:
+        with _t:
+            model.fit(df)
+    except Exception:
+        # Includes _FitTimeout's TimeoutError. A single unfittable series is a
+        # fallback row, not a dead run.
+        return key, None
     return key, model_to_json(model)
 
 
@@ -286,9 +373,17 @@ def fit_series_models(
         delayed(_fit_one_series)(key, dates, values, holidays_df, config, xmas_frame)
         for key, dates, values in jobs
     )
+
+    # _fit_one_series returns None for a degenerate series or a fit that raised
+    # or timed out. Drop those; their rows go to FallbackStats.
+    models = {key: model_json for key, model_json in results if model_json is not None}
+    n_unfittable = len(results) - len(models)
     if verbose:
-        print(f"  {len(results)}/{len(jobs)} series fit.")
-    return dict(results)
+        print(f"  {len(models)}/{len(jobs)} series fit.")
+        if n_unfittable:
+            print(f"  {n_unfittable} series were degenerate or failed to fit "
+                  f"-> fallback.")
+    return models
 
 
 # ---------------------------------------------------------------------------
