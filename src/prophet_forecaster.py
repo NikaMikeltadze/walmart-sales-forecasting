@@ -102,55 +102,52 @@ def _fit_one_store_prophet(
     return int(store), model_to_json(model)
 
 
-# How many trailing weeks of (non-holiday) history feed the regular-week dept
-# shares - recent enough that a dept's current mix matters more than its
-# 2010 mix, but still wide enough (half a year) for stable per-(Store, Dept)
-# averages. Holiday shares deliberately do NOT use this window - see
-# DeptShareStats below.
-DEPT_SHARE_RECENCY_WEEKS = 26
+# A per-store holiday-share ratio is too noisy to use directly (only ~5
+# holiday weeks per store in 2.5 years of history) and a naive pool-then-
+# divide estimate across stores is invalid (mixes stores of very different
+# sizes - see DeptShareStats). Clipping the per-store ratio-of-ratios before
+# averaging keeps one outlier store from dominating the pooled multiplier.
+HOLIDAY_MULTIPLIER_CLIP = (0.2, 5.0)
 
 
 @dataclass
 class DeptShareStats:
-    """Stats behind `ProphetForecastPipeline._dept_share`, split into a
-    regular-week and a holiday-week regime (see its docstring for why)."""
+    """Stats behind `ProphetForecastPipeline._dept_share`.
 
-    store_total_mean_regular: dict[int, float]
-    avg_store_total_regular: float
-    store_dept_mean_regular: dict[tuple[int, int], float]
-    dept_mean_regular: dict[int, float]
-    avg_store_total_holiday: float
-    dept_mean_holiday: dict[int, float]
+    The base share is the same per-(Store, Dept) historical share used for
+    every week (full history, no recency window - a recency-windowed
+    version was tried and made the actual Kaggle score worse, likely from
+    noisier per-(Store, Dept) estimates on the ~90% of rows that are
+    regular weeks). On top of that, holiday weeks get a per-department
+    *multiplier* (see `compute_dept_share_stats`) rather than a wholesale
+    replacement - WMAE weights holiday weeks 5x and department mix shifts
+    on them (e.g. toy/electronics depts spike at Christmas), but the
+    multiplier only nudges the store's own share up or down instead of
+    discarding store-specific information for a company-wide average.
+    """
+
+    store_total_mean: dict[int, float]
+    avg_store_total: float
+    store_dept_mean: dict[tuple[int, int], float]
+    dept_mean: dict[int, float]
+    dept_holiday_multiplier: dict[int, float]
 
 
-def compute_dept_share_stats(
-    train_df: pd.DataFrame, recency_weeks: int = DEPT_SHARE_RECENCY_WEEKS
-) -> DeptShareStats:
-    """Stats for `ProphetForecastPipeline`'s dept-share disaggregation, split
-    by whether the target week is a holiday week (`IsHoliday`).
+def compute_dept_share_stats(train_df: pd.DataFrame) -> DeptShareStats:
+    """Stats for `ProphetForecastPipeline`'s dept-share disaggregation.
 
-    WMAE weights holiday weeks 5x, and department mix shifts hard on them
-    (e.g. toy/electronics depts spike at Christmas while others barely
-    move) - a single flat historical share misallocates the store's
-    forecast on exactly the weeks that matter most. So:
+    `dept_holiday_multiplier[dept]` answers "how much bigger or smaller
+    does this department's share of ITS OWN store's total get on a holiday
+    week, relative to that same store's regular-week share" - computed per
+    store (holiday_share / regular_share, a ratio-of-ratios) and then
+    averaged across every store that has both regimes' history for that
+    department. Averaging the ratio (not pooling raw sums first) means no
+    single store's size can dominate the estimate. Falls back to 1.0 (no
+    adjustment) for a department with no holiday history anywhere.
 
-    - **Regular weeks**: per-(Store, Dept) share, from the last
-      `recency_weeks` of non-holiday history - recent enough to track
-      drift in a store's own department mix.
-    - **Holiday weeks**: pooled across *all* stores per department, from
-      the FULL history (not the recency window) - a single store only sees
-      ~5 holiday weeks in 2.5 years of training data, far too sparse to
-      estimate a per-store holiday share reliably. Pooling trades away
-      store-specific holiday behavior for a much more stable estimate of
-      "how does this department's mix shift on a holiday week."
-
-    Both regimes fall back to the (regular-week) company-wide
-    `dept_mean_regular` / `avg_store_total_regular` ratio for a department
-    never seen in the relevant regime.
-
-    The denominators are per-date STORE TOTALS (summed across depts), not
-    `WalmartFeatureEngineer.store_mean_`'s per-row mean - the per-store
-    Prophet model is fit on that same per-date total (see
+    The base share's denominators are per-date STORE TOTALS (summed across
+    depts), not `WalmartFeatureEngineer.store_mean_`'s per-row mean - the
+    per-store Prophet model is fit on that same per-date total (see
     `fit_store_models` below), and the per-row mean would be off by
     roughly the store's department count.
     """
@@ -158,31 +155,38 @@ def compute_dept_share_stats(
     train_df["Date"] = pd.to_datetime(train_df["Date"])
     train_df["IsHoliday"] = train_df["IsHoliday"].astype(bool)
 
-    cutoff = train_df["Date"].max() - pd.Timedelta(weeks=recency_weeks)
-    recent_regular = train_df[(train_df["Date"] > cutoff) & (~train_df["IsHoliday"])]
+    store_totals = train_df.groupby(["Store", "Date"])["Weekly_Sales"].sum()
+    store_total_mean = store_totals.groupby("Store").mean().to_dict()
+    avg_store_total = float(store_totals.mean())
+    store_dept_mean = train_df.groupby(["Store", "Dept"])["Weekly_Sales"].mean().to_dict()
+    dept_mean = train_df.groupby("Dept")["Weekly_Sales"].mean().to_dict()
+
     holiday = train_df[train_df["IsHoliday"]]
+    regular = train_df[~train_df["IsHoliday"]]
 
-    regular_totals = recent_regular.groupby(["Store", "Date"])["Weekly_Sales"].sum()
-    store_total_mean_regular = regular_totals.groupby("Store").mean().to_dict()
-    avg_store_total_regular = float(regular_totals.mean())
-    store_dept_mean_regular = (
-        recent_regular.groupby(["Store", "Dept"])["Weekly_Sales"].mean().to_dict()
-    )
-    dept_mean_regular = recent_regular.groupby("Dept")["Weekly_Sales"].mean().to_dict()
+    holiday_store_total_mean = holiday.groupby(["Store", "Date"])["Weekly_Sales"].sum().groupby("Store").mean()
+    holiday_store_dept_mean = holiday.groupby(["Store", "Dept"])["Weekly_Sales"].mean()
+    holiday_share = holiday_store_dept_mean / holiday_store_dept_mean.index.get_level_values(
+        "Store"
+    ).map(holiday_store_total_mean)
 
-    holiday_totals = holiday.groupby(["Store", "Date"])["Weekly_Sales"].sum()
-    avg_store_total_holiday = (
-        float(holiday_totals.mean()) if len(holiday_totals) else avg_store_total_regular
-    )
-    dept_mean_holiday = holiday.groupby("Dept")["Weekly_Sales"].mean().to_dict()
+    regular_store_total_mean = regular.groupby(["Store", "Date"])["Weekly_Sales"].sum().groupby("Store").mean()
+    regular_store_dept_mean = regular.groupby(["Store", "Dept"])["Weekly_Sales"].mean()
+    regular_share = regular_store_dept_mean / regular_store_dept_mean.index.get_level_values(
+        "Store"
+    ).map(regular_store_total_mean)
+
+    paired = pd.DataFrame({"holiday_share": holiday_share, "regular_share": regular_share}).dropna()
+    ratio = (paired["holiday_share"] / paired["regular_share"].replace(0, np.nan)).dropna()
+    ratio = ratio.clip(*HOLIDAY_MULTIPLIER_CLIP)
+    dept_holiday_multiplier = ratio.groupby(level="Dept").mean().to_dict()
 
     return DeptShareStats(
-        store_total_mean_regular=store_total_mean_regular,
-        avg_store_total_regular=avg_store_total_regular,
-        store_dept_mean_regular=store_dept_mean_regular,
-        dept_mean_regular=dept_mean_regular,
-        avg_store_total_holiday=avg_store_total_holiday,
-        dept_mean_holiday=dept_mean_holiday,
+        store_total_mean=store_total_mean,
+        avg_store_total=avg_store_total,
+        store_dept_mean=store_dept_mean,
+        dept_mean=dept_mean,
+        dept_holiday_multiplier=dept_holiday_multiplier,
     )
 
 
@@ -265,29 +269,29 @@ class ProphetForecastPipeline:
         self.external_features = external_features
 
     def _dept_share(self, store: int, dept: int, is_holiday: bool) -> float:
-        """(Store, Dept)'s share of that store's total sales, for a holiday
-        or a regular week - see `DeptShareStats` for why these differ.
+        """(Store, Dept)'s share of that store's total sales.
 
-        Holiday weeks use the department's pooled (all-stores) share of an
-        average store's holiday-week total - a single store's own holiday
-        history is too sparse to trust per-store. Regular weeks use the
-        store's own recent per-dept share, falling back to the pooled
-        regular-week share when this (Store, Dept) combo has no recent
-        history (e.g. a department appearing at a store for the first time).
+        Base share is this (Store, Dept)'s own historical share (falling
+        back to the department's company-wide average share when this
+        combo was never seen at fit time - e.g. a department appearing at
+        a store for the first time). On a holiday week, that base share is
+        scaled by `dept_holiday_multiplier` - see `compute_dept_share_stats`
+        for why this is a multiplier on top of the store's own share rather
+        than a wholesale replacement.
         """
         s = self.share_stats
-        if is_holiday:
-            if s.avg_store_total_holiday > 0:
-                return s.dept_mean_holiday.get(dept, 0.0) / s.avg_store_total_holiday
-            return 0.0
-
-        store_total = s.store_total_mean_regular.get(store, s.avg_store_total_regular)
-        sd_mean = s.store_dept_mean_regular.get((store, dept))
+        store_total = s.store_total_mean.get(store, s.avg_store_total)
+        sd_mean = s.store_dept_mean.get((store, dept))
         if sd_mean is not None and store_total > 0:
-            return sd_mean / store_total
-        if s.avg_store_total_regular > 0:
-            return s.dept_mean_regular.get(dept, 0.0) / s.avg_store_total_regular
-        return 0.0
+            base_share = sd_mean / store_total
+        elif s.avg_store_total > 0:
+            base_share = s.dept_mean.get(dept, 0.0) / s.avg_store_total
+        else:
+            base_share = 0.0
+
+        if is_holiday:
+            return base_share * s.dept_holiday_multiplier.get(dept, 1.0)
+        return base_share
 
     def predict(self, raw_test_df: pd.DataFrame) -> np.ndarray:
         """Forecast Weekly_Sales for every row of a raw test.csv-shaped frame.
