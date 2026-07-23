@@ -20,8 +20,13 @@ statsmodels
 pmdarima
 prophet
 
-# Deep learning models (N-BEATS, TFT/PatchTST, DLinear)
-darts[torch]
+# Deep learning models (N-BEATS + DLinear on darts; TFT on neuralforecast).
+# N-BEATS uses darts NBEATSModel with fit(sample_weight=...) for the 5x holiday
+# WMAE loss, which needs darts >= 0.30.
+darts[torch]>=0.30
+
+# Hyperparameter search (Optuna TPE study in the N-BEATS CV stage)
+optuna
 
 # Notebook execution
 jupyter
