@@ -20,8 +20,9 @@ statsmodels
 pmdarima
 prophet
 
-# Deep learning models (N-BEATS, TFT/PatchTST, DLinear)
-darts[torch]
+# Deep learning models
+darts[torch]  # N-BEATS, DLinear
+neuralforecast  # TFT - Darts' TFT/N-BEATS results were flagged as the wrong tool; neuralforecast implements TFT natively
 
 # Notebook execution
 jupyter
